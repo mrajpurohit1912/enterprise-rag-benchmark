@@ -47,6 +47,7 @@ env/
 # ==========================================
 # Local Vector Stores & Databases
 # ==========================================
+/data/
 qdrant_db/
 qdrant_data/
 chroma_db/
