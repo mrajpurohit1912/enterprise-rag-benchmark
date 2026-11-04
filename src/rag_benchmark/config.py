@@ -1,6 +1,7 @@
 """
 Configuration schema for the Enterprise RAG benchmark pipeline.
 """
+from typing import Optional
 from pydantic import BaseModel, Field
 
 
@@ -10,6 +11,7 @@ class RAGConfig(BaseModel):
         default="ingalepratap/EnterpriseRAG-Bench",
         description="Hugging Face benchmark dataset name",
     )
+
 
     # Storage
     storage_path: str = Field(
@@ -65,6 +67,10 @@ class RAGConfig(BaseModel):
     rerank_top_n: int = Field(
         default=3,
         description="Number of top candidates passed to Generator after Cross-Encoder reranking",
+    )
+    rerank_score_threshold: Optional[float] = Field(
+        default=-3.0,
+        description="Minimum cross-encoder logit score required to trigger LLM generation. Below this, early refusal is returned.",
     )
     rrf_k: int = Field(
         default=60,

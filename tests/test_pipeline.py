@@ -6,7 +6,7 @@ from rag_benchmark import EnterpriseRAGPipeline, RAGConfig
 
 
 def test_enterprise_rag_pipeline_end_to_end():
-    test_db_dir = "data/test_qdrant_db"
+    test_db_dir = "/tmp/test_qdrant_db"
     shutil.rmtree(test_db_dir, ignore_errors=True)
 
     config = RAGConfig(
@@ -67,6 +67,13 @@ def test_enterprise_rag_pipeline_end_to_end():
     top_doc_id = response["retrieved_chunks"][0]["doc_id"]
     assert top_doc_id == "dsid_runbook_canary", f"Expected dsid_runbook_canary top doc, got {top_doc_id}"
     assert "dsid_runbook_canary" in response["cited_doc_ids"] or "kubectl rollout undo" in response["answer"]
+
+    # 3. Test Confidence Gatekeeper (Out-of-domain query early refusal)
+    irrelevant_query = "Who won the 2022 FIFA World Cup in Qatar?"
+    irrelevant_resp = pipeline.query(irrelevant_query)
+    print("\nIrrelevant Query Response:", irrelevant_resp["answer"])
+    assert irrelevant_resp["answer"] == "Information not found in internal documents."
+    assert irrelevant_resp["metadata"]["status"] == "low_confidence_refusal"
 
     # Clean up test database
     pipeline.close()

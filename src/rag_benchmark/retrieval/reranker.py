@@ -18,17 +18,24 @@ class CrossEncoderReranker:
         query: str,
         candidates: List[Dict],
         top_n: int = 3,
+        max_passage_chars: int = 1500,
     ) -> List[Dict]:
         """
-        Evaluates (Query, Title + ChildText) pairs and reorders by relevance logits.
+        Evaluates (Query, Title + Context) pairs using Cross-Encoder joint attention.
+        Enriches candidate text with parent context to capture broader semantic nuances.
         """
         if not candidates:
             return []
 
-        pairs = [
-            [query, f"{cand.get('title', '')}\n{cand.get('child_text', '')}"]
-            for cand in candidates
-        ]
+        pairs = []
+        for cand in candidates:
+            title = cand.get("title", "").strip()
+            # Prefer parent_text to give the CrossEncoder full section context; fallback to child_text
+            passage = cand.get("parent_text") or cand.get("child_text", "")
+            passage_snippet = passage[:max_passage_chars].strip()
+
+            text = f"Title: {title}\n{passage_snippet}" if title else passage_snippet
+            pairs.append([query, text])
 
         scores = self.model.predict(pairs)
 

@@ -296,3 +296,94 @@ $$RRF\_Score(d) = \sum_{m \in \{dense, sparse\}} \frac{1}{k + rank_m(d)} \quad (
 | **Retrieval** | Hybrid Search (Dense + BM25) + ACL Pre-Filtering | RRF score fusion; strict role-based data isolation. |
 | **Re-Ranking** | Cross-Encoder scoring (`bge-reranker-large`) | Candidate pool pruned from Top-50 to Top 5–10 chunks. |
 | **Generation** | Grounded prompting + Lost-in-the-Middle assembly | Inline citations `[Doc ID]`; explicit refusal on missing data. |
+
+
+1. loading the document
+2. doing basic cleaning normalizing and removing duplicate
+3. Hierarchial chunking (Which uses recursive chunking)
+  - Parent Chunks - each cleaned doc is given for chunking which returns n number of Parent chunks
+  - Child Chunks  - for each parent chunk then we create a child chunk
+
+4. Storing
+  - Child Chunks are stored in Vector DB
+    - in Dense Embeddings(Dense Embeddings) - stored as embeddings not raw text cosine similarity
+    - in Sparse Vectors(Sparse Vectors) - stored as numerical vectors using bm25
+  - Parent Chunks are also stored in Vector DB only in raw text, no embedding or numerical vectors for fast retrieval and thats why we are using hierarchial chunking else we could have simply stored the whole document
+
+5. Retrieving 
+  - we process the user query for retrieving the documents.
+    - we calculate numerical vectors for retrieving the sparse vectors
+    - we calculate embeddings for retrieving the dense vectors
+    - then we are using RRF for retrieving the top documents and its called hybrid RAG approach
+
+6. Re Ranking for improving the retrieval results
+  - Then we are using CrossEncoder model for calculating the re-ranking score between the retrieved documents and the user query
+
+
+# Doubts
+1. What is HSNW and where does it fits in our current pipleline - like while storing or retrieving ? what other things are there like HSNW and which one to use when? explain as pe industry standard enterprise level
+2. what is compute_sparse_vector? 
+3. how gc collector is getting used ?
+4. what is Reciprocal Rank Fusion (RRF) ? what other techniques are there ?which one to use when?
+
+
+# Evaluation Understanding
+so RAG Evaluation happens at 3 stages Retrieval and Generation(LLM generation)
+- Retrieval and ReRanking Evaluation
+  - Context Recall
+  - Recall@k
+  - Precision@k
+  - Mean Reciprocal Rank(MRR)
+  - nDCG@K(Normalized Discounted Cumulative Gain )
+  - Context Precision / Signal-to-Noise Ratio
+  - Hit Rate @ k
+  - MAP @ K
+
+- Generation Evaluation
+  - Faithfulness
+  - Ground Truth 
+  - Answer Correctness
+  - Answer Relevancy
+  - Answer Completeness
+  - Semantic Similarity
+  - Exact Match / F1
+  - Accuracy
+  - Hallucination
+  - Rouge-L,Rouge1,Rouge2
+
+- Infrastructure and System Monitoring/Evaluation(Need to measure these separately for each of the components like retrieval,re-ranking,generation,etc)
+  - TTFT 
+  - Latencies(P50, P95, P99)
+    - End to End Latency
+    - Retrieval Latency 
+    - Re-Ranking Latency
+  - Tokens per second
+  - Requests per second
+  - Error rate
+  - Cost per query
+  - Availability
+  - Token Count
+  - Cache Hit Rate
+  - Citation Precision & Coverage
+
+- Security and governance metrics(We will build later on when we build the complete project)
+  - Tenant isolation
+  - Document-level ACL
+  - PII protection
+  - Prompt injection
+  - Data leakage
+  - Citation integrity
+  - Auditability
+  - Refusal behavior
+
+
+NOTE: Need to create a golden dataset and test our RAG pipeline on that golden dataset and not on any random question right ? and every time we make any changes in our RAG architecture or build a new RAG pipeline with different architecture for same Problem we need to use same Golder Dataset for evaluating that particular RAG pipeline
+
+# Doubts regarding
+1. on which dataset we need to evaluate
+  - Shall we created a new dataset ?
+  - use the the validation or test part from the dataset ?
+  - or some other way to create and evaluate 
+2. Difference between RAGAS,DeepEval,TruLens?
+  - Which one to use when ?
+explain as per industry standard enterprise level?

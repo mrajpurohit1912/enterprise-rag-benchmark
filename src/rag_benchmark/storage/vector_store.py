@@ -1,4 +1,8 @@
+import collections
+import math
+import re
 import uuid
+import zlib
 from typing import Dict, List, Optional
 
 from qdrant_client import QdrantClient
@@ -6,12 +10,43 @@ from qdrant_client.models import (
     Distance,
     FieldCondition,
     Filter,
+    Fusion,
+    FusionQuery,
+    HnswConfigDiff,
     MatchValue,
     PointStruct,
+    Prefetch,
+    SparseIndexParams,
+    SparseVector,
+    SparseVectorParams,
     VectorParams,
 )
 
 from rag_benchmark.models import ChildChunk, ParentChunk
+
+
+def compute_sparse_vector(text: str) -> SparseVector:
+    """
+    Computes deterministic on-disk term frequency sparse vector.
+    Maps word tokens to positive 31-bit integer indices with sublinear term weighting.
+    """
+    if not text:
+        return SparseVector(indices=[], values=[])
+    tokens = re.findall(r"\w+", text.lower())
+    if not tokens:
+        return SparseVector(indices=[], values=[])
+
+    counts = collections.Counter(tokens)
+    indices: List[int] = []
+    values: List[float] = []
+
+    for token, count in counts.items():
+        idx = zlib.crc32(token.encode("utf-8")) & 0x7FFFFFFF
+        val = float(1.0 + math.log(count))
+        indices.append(idx)
+        values.append(val)
+
+    return SparseVector(indices=indices, values=values)
 
 
 class QdrantVectorStore:
@@ -33,10 +68,21 @@ class QdrantVectorStore:
         if self.collection_name not in collections:
             self.client.create_collection(
                 collection_name=self.collection_name,
-                vectors_config=VectorParams(
-                    size=self.vector_size,
-                    distance=Distance.COSINE,
+                vectors_config={
+                    "dense": VectorParams(
+                        size=self.vector_size,
+                        distance=Distance.COSINE,
+                        on_disk=True,
+                    )
+                },
+                hnsw_config=HnswConfigDiff(
+                    on_disk=True,
                 ),
+                sparse_vectors_config={
+                    "sparse": SparseVectorParams(
+                        index=SparseIndexParams(on_disk=True),
+                    )
+                },
             )
 
     def upsert_chunks(
@@ -70,7 +116,10 @@ class QdrantVectorStore:
             points.append(
                 PointStruct(
                     id=point_id,
-                    vector=chunk.dense_vector,
+                    vector={
+                        "dense": chunk.dense_vector,
+                        "sparse": compute_sparse_vector(chunk.child_text),
+                    },
                     payload=payload,
                 )
             )
@@ -86,16 +135,17 @@ class QdrantVectorStore:
 
         return total_upserted
 
-    def search(
+    def search_hybrid(
         self,
-        query_vector: List[float],
+        query_dense: List[float],
+        query_text: str,
         top_k: int = 50,
         source_type: Optional[str] = None,
     ) -> List[Dict]:
         """
-        Executes HNSW dense vector search with optional payload filtering.
+        Executes native Qdrant Hybrid search combining dense vectors and sparse keywords
+        with Reciprocal Rank Fusion (RRF) on disk.
         """
-        # Optional metadata pre-filtering (e.g. source_type == 'confluence')
         query_filter = None
         if source_type:
             query_filter = Filter(
@@ -107,10 +157,75 @@ class QdrantVectorStore:
                 ]
             )
 
-        # Qdrant query_points search
+        query_sparse = compute_sparse_vector(query_text)
+
+        prefetches = [
+            Prefetch(
+                query=query_dense,
+                using="dense",
+                filter=query_filter,
+                limit=top_k,
+            )
+        ]
+        if query_sparse.indices:
+            prefetches.append(
+                Prefetch(
+                    query=query_sparse,
+                    using="sparse",
+                    filter=query_filter,
+                    limit=top_k,
+                )
+            )
+
+        search_result = self.client.query_points(
+            collection_name=self.collection_name,
+            prefetch=prefetches,
+            query=FusionQuery(fusion=Fusion.RRF),
+            limit=top_k,
+            with_payload=True,
+        )
+
+        results = []
+        for rank, hit in enumerate(search_result.points, start=1):
+            payload = hit.payload or {}
+            results.append({
+                "rank": rank,
+                "score": hit.score,
+                "child_id": payload.get("child_id"),
+                "parent_id": payload.get("parent_id"),
+                "doc_id": payload.get("doc_id"),
+                "source_type": payload.get("source_type"),
+                "title": payload.get("title"),
+                "child_text": payload.get("child_text"),
+                "parent_text": payload.get("parent_text"),
+            })
+
+        return results
+
+    def search(
+        self,
+        query_vector: List[float],
+        top_k: int = 50,
+        source_type: Optional[str] = None,
+    ) -> List[Dict]:
+        """
+        Executes HNSW dense vector search with optional payload filtering.
+        """
+        query_filter = None
+        if source_type:
+            query_filter = Filter(
+                must=[
+                    FieldCondition(
+                        key="source_type",
+                        match=MatchValue(value=source_type),
+                    )
+                ]
+            )
+
         search_result = self.client.query_points(
             collection_name=self.collection_name,
             query=query_vector,
+            using="dense",
             query_filter=query_filter,
             limit=top_k,
             with_payload=True,

@@ -5,6 +5,7 @@ Qdrant Vector Store + BM25 -> Hybrid Retrieval (RRF) -> Cross-Encoder Reranking 
 Local Grounded LLM Generation.
 """
 from typing import Any, Dict, List, Optional, Union
+from collections.abc import Iterable,Iterator
 
 from rag_benchmark.chunking.hierarchical import HierarchicalChunker
 from rag_benchmark.config import RAGConfig
@@ -50,10 +51,6 @@ class EnterpriseRAGPipeline:
             model_name=self.config.reranker_model,
         )
 
-        # In-memory parent and child registries
-        self.parent_store: Dict[str, ParentChunk] = {}
-        self.child_chunks: List[ChildChunk] = []
-
         # Lazy-loaded Generator (avoids GPU VRAM allocation until query time)
         self._generator: Optional[LocalRAGGenerator] = None
 
@@ -66,11 +63,10 @@ class EnterpriseRAGPipeline:
             )
         return self._generator
 
-    def index_documents(
+    def iter_cleaned_documents(
         self,
-        raw_docs: List[Union[Dict, RawDocuments]],
-        batch_size: int = 500,
-    ) -> Dict[str, Any]:
+        raw_docs: Iterable[dict],
+    ) -> Iterator[CleanedDocuments]:
         """
         Indexes an incoming batch of documents into the enterprise RAG system:
         1. Normalizes text (Unicode NFKC, whitespace, linebreaks).
@@ -87,7 +83,6 @@ class EnterpriseRAGPipeline:
         Returns:
             Indexing statistics summary.
         """
-        cleaned_docs: List[CleanedDocuments] = []
 
         for doc in raw_docs:
             if isinstance(doc, dict):
@@ -114,8 +109,7 @@ class EnterpriseRAGPipeline:
                 title=title,
                 content=content,
             )
-            cleaned_docs.append(
-                CleanedDocuments(
+            yield CleanedDocuments(
                     raw_documents=raw_model,
                     doc_id=doc_id,
                     source_type=source_type,
@@ -124,49 +118,99 @@ class EnterpriseRAGPipeline:
                     cleaned_title=norm_title,
                     cleaned_content=norm_content,
                 )
+            
+    def _batch_iterator(
+        self,
+        iterable: Iterable[Any],
+        batch_size: int = 256,
+    ) -> Iterator[List[Any]]:
+        """Yields bounded slices from an iterable to preserve constant O(1) memory."""
+        batch: List[Any] = []
+        for item in iterable:
+            batch.append(item)
+            if len(batch) >= batch_size:
+                yield batch
+                batch = []
+        if batch:
+            yield batch
+
+    def index_documents(
+        self,
+        raw_docs: Iterable[dict],
+        batch_size: int = 256,
+    ) -> Dict[str, Any]:
+        """
+        Stream-indexes incoming documents in bounded micro-batches:
+        1. Normalizes and deduplicates via generator streaming.
+        2. Chunks documents into hierarchical Parent/Child chunks per batch.
+        3. Computes dense embeddings and on-disk sparse representations.
+        4. Persists child points with hydrated parent payloads directly in Qdrant.
+        5. Automatically collects garbage per batch, maintaining flat memory usage.
+
+        Args:
+            raw_docs: Iterable of raw document dicts or RawDocuments Pydantic models.
+            batch_size: Micro-batch size for streaming ingestion and upsertion.
+
+        Returns:
+            Indexing statistics summary.
+        """
+        import gc
+
+        total_received = 0
+        total_indexed = 0
+        total_parents = 0
+        total_children = 0
+        total_upserted = 0
+
+        if hasattr(raw_docs, "__len__"):
+            try:
+                total_received = len(raw_docs)
+            except TypeError:
+                pass
+
+        # Stream documents in batches of `batch_size`
+        cleaned_stream = self.iter_cleaned_documents(raw_docs)
+        for doc_batch in self._batch_iterator(cleaned_stream, batch_size=batch_size):
+            total_indexed += len(doc_batch)
+
+            # 1. Hierarchical chunking for this batch only
+            batch_parents, batch_children = self.chunker.chunk_documents(doc_batch)
+            if not batch_children:
+                continue
+
+            total_parents += len(batch_parents)
+            total_children += len(batch_children)
+
+            # 2. Dense Embeddings for Child Chunks in this batch
+            child_texts = [c.child_text for c in batch_children]
+            embeddings = self.retriever.embedding_model.encode(
+                child_texts,
+                batch_size=min(len(child_texts), 64),
+                normalize_embeddings=True,
+                show_progress_bar=False,
             )
 
-        if not cleaned_docs:
-            return {
-                "documents_received": len(raw_docs),
-                "documents_indexed": 0,
-                "duplicates_skipped": len(self.deduplicator.duplicate_ids),
-                "parent_chunks": 0,
-                "child_chunks": 0,
-            }
+            for chunk, emb in zip(batch_children, embeddings):
+                chunk.dense_vector = emb.tolist()
 
-        # 2. Hierarchical Chunking
-        new_parents, new_children = self.chunker.chunk_documents(cleaned_docs)
-        self.parent_store.update(new_parents)
-        self.child_chunks.extend(new_children)
+            # 3. Upsert to Qdrant (dense vectors, sparse vectors, and parent payload stored on disk)
+            upserted = self.vector_store.upsert_chunks(
+                chunks=batch_children,
+                parent_store=batch_parents,
+                batch_size=batch_size,
+            )
+            total_upserted += upserted
 
-        # 3. Dense Embeddings for Child Chunks
-        child_texts = [c.child_text for c in new_children]
-        embeddings = self.retriever.embedding_model.encode(
-            child_texts,
-            normalize_embeddings=True,
-            show_progress_bar=len(new_children) > 100,
-        )
-
-        for chunk, emb in zip(new_children, embeddings):
-            chunk.dense_vector = emb.tolist()
-
-        # 4. Upsert to Qdrant
-        total_upserted = self.vector_store.upsert_chunks(
-            chunks=new_children,
-            parent_store=self.parent_store,
-            batch_size=batch_size,
-        )
-
-        # 5. Build / Update BM25 Sparse Index
-        self.retriever.build_bm25_index(self.child_chunks)
+            # 4. Immediate Garbage Collection of batch structures to maintain constant RAM
+            del doc_batch, batch_parents, batch_children, child_texts, embeddings
+            gc.collect()
 
         return {
-            "documents_received": len(raw_docs),
-            "documents_indexed": len(cleaned_docs),
+            "documents_received": total_received or total_indexed,
+            "documents_indexed": total_indexed,
             "duplicates_skipped": len(self.deduplicator.duplicate_ids),
-            "parent_chunks": len(new_parents),
-            "child_chunks": len(new_children),
+            "parent_chunks": total_parents,
+            "child_chunks": total_children,
             "points_upserted": total_upserted,
             "total_qdrant_points": self.vector_store.count(),
         }
@@ -182,8 +226,8 @@ class EnterpriseRAGPipeline:
         """
         Executes end-to-end grounded RAG answering:
         1. Normalizes user query.
-        2. Executes Hybrid Search (Qdrant Dense + BM25 Sparse + RRF).
-        3. Hydrates parent document text for full context window.
+        2. Executes Native Hybrid Search in Qdrant (Dense + Sparse + RRF).
+        3. Hydrates parent document text directly from on-disk payload.
         4. Reranks candidate passages using joint Cross-Encoder.
         5. Synthesizes final grounded answer with strict inline citations.
 
@@ -202,7 +246,7 @@ class EnterpriseRAGPipeline:
         n_rerank = top_n_rerank or self.config.rerank_top_n
         new_tokens = max_new_tokens or self.config.max_new_tokens
 
-        # 1. Hybrid Retrieval (Dense + BM25 fused with RRF)
+        # 1. Native Hybrid Retrieval (Qdrant Dense + Sparse fused with RRF on disk)
         candidates = self.retriever.search(
             query=clean_query,
             top_k=k_retrieve,
@@ -219,19 +263,34 @@ class EnterpriseRAGPipeline:
                 "metadata": {"status": "no_candidates_found"},
             }
 
-        # 2. Hydrate Parent Text if missing (e.g. from BM25 fallback)
-        for cand in candidates:
-            if not cand.get("parent_text"):
-                p_id = cand.get("parent_id")
-                if p_id and p_id in self.parent_store:
-                    cand["parent_text"] = self.parent_store[p_id].parent_text
-
-        # 3. Cross-Encoder Reranking
+        # 2. Cross-Encoder Reranking
         reranked_docs = self.reranker.rerank(
             query=clean_query,
             candidates=candidates,
             top_n=n_rerank,
         )
+
+        # 3. Confidence Gatekeeper: Early refusal if top candidate is irrelevant
+        best_score = reranked_docs[0].get("rerank_score", -999.0) if reranked_docs else -999.0
+        if (
+            self.config.rerank_score_threshold is not None
+            and best_score < self.config.rerank_score_threshold
+        ):
+            return {
+                "query": query_text,
+                "answer": "Information not found in internal documents.",
+                "cited_doc_ids": [],
+                "context": "",
+                "retrieved_chunks": reranked_docs,
+                "metadata": {
+                    "source_type_filter": source_type,
+                    "status": "low_confidence_refusal",
+                    "top_rerank_score": best_score,
+                    "threshold": self.config.rerank_score_threshold,
+                    "candidates_retrieved": len(candidates),
+                    "docs_reranked": len(reranked_docs),
+                },
+            }
 
         # 4. Grounded Local Generation
         gen_result = self.generator.generate(
